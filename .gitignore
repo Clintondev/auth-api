@@ -1,0 +1,51 @@
+# Java
+*.class
+*.jar
+*.war
+*.ear
+
+# Maven
+/target/
+!.mvn/wrapper/maven-wrapper.jar
+.mvn/wrapper/maven-wrapper.properties
+/logs/
+*.log
+
+# IDEs e Ferramentas de Desenvolvimento
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+*.swp
+
+# Arquivos de Configuração Sensíveis
+.env
+application.properties
+application.yml
+
+# Sistema Operacional
+.DS_Store
+Thumbs.db
+
+# Arquivos temporários
+*.tmp
+*.bak
+*.old
+*.orig
+
+# Testes
+/test-output/
+coverage/
+jacoco.exec
+
+# Configuração de Banco de Dados
+*.db
+*.sqlite
+
+# Arquivos do Docker (se houver)
+/docker-compose.override.yml
+*.pid
+
+# Configuração do Spring Boot (opcional)
+spring.log
