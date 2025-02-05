@@ -66,3 +66,7 @@ spring.mail.from=seu_email@email.com.br
 # Variaveis
 JWT_SECRET_KEY= 
 AES_SECRET_KEY= 
+
+## Run
+mvn clean install
+mvn spring-boot:run
