@@ -1,6 +1,7 @@
 //src/main/java/com/solubio/manutencao/security/JwtAuthenticationFilter.java
 package com.solubio.manutencao.security;
 
+import com.solubio.manutencao.repository.RevokedTokenRepository;
 import io.jsonwebtoken.Claims;
 import io.jsonwebtoken.Jwts;
 import io.github.cdimascio.dotenv.Dotenv;
@@ -26,11 +27,13 @@ import java.util.stream.Collectors;
 public class JwtAuthenticationFilter extends OncePerRequestFilter {
 
     private final UserDetailsService userDetailsService;
+    private final RevokedTokenRepository revokedTokenRepository;
     private final Dotenv dotenv = Dotenv.load();
     private final String secretKey = dotenv.get("JWT_SECRET_KEY");
 
-    public JwtAuthenticationFilter(UserDetailsService userDetailsService) {
+    public JwtAuthenticationFilter(UserDetailsService userDetailsService, RevokedTokenRepository revokedTokenRepository) {
         this.userDetailsService = userDetailsService;
+        this.revokedTokenRepository = revokedTokenRepository;
     }
 
     @Override
@@ -46,6 +49,14 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
         }
 
         final String token = authHeader.substring(7);
+
+        // Check if the token is revoked
+        if (revokedTokenRepository.existsByToken(token)) {
+            response.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
+            response.getWriter().write("Token revogado. Faça login novamente.");
+            return;
+        }
+
         final String email = extractEmail(token);
 
         if (email != null && SecurityContextHolder.getContext().getAuthentication() == null) {
@@ -56,11 +67,13 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
                         .setSigningKey(secretKey.getBytes())
                         .parseClaimsJws(token)
                         .getBody();
-                List<String> tokenRoles = ((List<?>) claims.get("roles"))
+                List<String> tokenRoles = claims.get("roles") != null
+                    ? ((List<?>) claims.get("roles"))
                         .stream()
                         .filter(role -> role instanceof String)
                         .map(role -> ((String) role).toUpperCase(Locale.ROOT))
-                        .collect(Collectors.toList());
+                        .collect(Collectors.toList())
+                    : List.of();  
 
                 List<String> userRoles = userDetails.getAuthorities()
                         .stream()

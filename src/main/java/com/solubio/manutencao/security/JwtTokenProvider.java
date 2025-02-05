@@ -1,14 +1,14 @@
 //src/main/java/com/solubio/manutencao/security/JwtTokenProvider.java
 package com.solubio.manutencao.security;
 
+import com.solubio.manutencao.model.RefreshToken;
 import com.solubio.manutencao.model.User;
-import io.jsonwebtoken.Jwts;
+import com.solubio.manutencao.repository.RefreshTokenRepository;
 import io.github.cdimascio.dotenv.Dotenv;
-import io.jsonwebtoken.SignatureAlgorithm;
 import org.springframework.stereotype.Component;
 
-import java.util.Date;
-import java.util.stream.Collectors;
+import java.time.LocalDateTime;
+import java.util.UUID;
 
 @Component
 public class JwtTokenProvider {
@@ -18,28 +18,33 @@ public class JwtTokenProvider {
     private final long accessTokenExpiration = 900_000;  // 15 minutos
     private final long refreshTokenExpiration = 7 * 24 * 60 * 60 * 1000;  // 7 dias
 
+    private final RefreshTokenRepository refreshTokenRepository;
+
+    public JwtTokenProvider(RefreshTokenRepository refreshTokenRepository) {
+        this.refreshTokenRepository = refreshTokenRepository;
+    }
+
     public String generateAccessToken(User user) {
-        return Jwts.builder()
+        return io.jsonwebtoken.Jwts.builder()
                 .setSubject(user.getEmail())
-                .claim("roles", user.getRoles().stream().map(role -> role.getName()).collect(Collectors.toList()))
-                .setIssuedAt(new Date())
-                .setExpiration(new Date(System.currentTimeMillis() + accessTokenExpiration))
-                .signWith(SignatureAlgorithm.HS256, secretKey.getBytes())
+                .setIssuedAt(new java.util.Date())
+                .setExpiration(new java.util.Date(System.currentTimeMillis() + accessTokenExpiration))
+                .signWith(io.jsonwebtoken.SignatureAlgorithm.HS256, secretKey.getBytes())
                 .compact();
     }
 
-    public String generateRefreshToken(User user) {
-        return Jwts.builder()
-                .setSubject(user.getEmail())
-                .setIssuedAt(new Date())
-                .setExpiration(new Date(System.currentTimeMillis() + refreshTokenExpiration))
-                .signWith(SignatureAlgorithm.HS256, secretKey.getBytes())
-                .compact();
+    public RefreshToken generateRefreshToken(User user) {
+        RefreshToken refreshToken = new RefreshToken();
+        refreshToken.setToken(UUID.randomUUID().toString());
+        refreshToken.setUser(user);
+        refreshToken.setExpiryDate(LocalDateTime.now().plusDays(7));
+        refreshToken.setRevoked(false);
+        return refreshTokenRepository.save(refreshToken);
     }
 
     public boolean validateToken(String token) {
         try {
-            Jwts.parser().setSigningKey(secretKey.getBytes()).parseClaimsJws(token);
+            io.jsonwebtoken.Jwts.parser().setSigningKey(secretKey.getBytes()).parseClaimsJws(token);
             return true;
         } catch (Exception e) {
             return false;
@@ -47,7 +52,7 @@ public class JwtTokenProvider {
     }
 
     public String extractEmail(String token) {
-        return Jwts.parser()
+        return io.jsonwebtoken.Jwts.parser()
                 .setSigningKey(secretKey.getBytes())
                 .parseClaimsJws(token)
                 .getBody()

@@ -5,9 +5,11 @@ import com.solubio.manutencao.model.AuditLog;
 import com.solubio.manutencao.model.User;
 import com.solubio.manutencao.model.AuthResponse;
 import com.solubio.manutencao.model.LoginRequest;
+import com.solubio.manutencao.model.RefreshToken;
 import com.solubio.manutencao.repository.AuditLogRepository;
 import com.solubio.manutencao.repository.UserRepository;
 import com.solubio.manutencao.repository.LoginAttemptRepository;
+import com.solubio.manutencao.repository.RefreshTokenRepository;
 import com.solubio.manutencao.model.LoginAttempt;
 import com.solubio.manutencao.security.JwtTokenProvider;
 import lombok.extern.slf4j.Slf4j;
@@ -20,6 +22,7 @@ import jakarta.validation.Valid;
 import jakarta.servlet.http.HttpServletRequest;
 
 import java.time.LocalDateTime;
+import java.util.Map;
 
 @RestController
 @RequestMapping("/auth")
@@ -42,6 +45,9 @@ public class AuthController {
     private LoginAttemptRepository loginAttemptRepository;
 
     @Autowired
+    private RefreshTokenRepository refreshTokenRepository;
+
+    @Autowired
     private HttpServletRequest request;
 
     private void logAudit(String action, String userEmail) {
@@ -60,13 +66,7 @@ public class AuthController {
 
         String email = loginRequest.getEmail();
         LoginAttempt attempt = loginAttemptRepository.findByEmail(email)
-                .orElseGet(() -> {
-                    LoginAttempt newAttempt = new LoginAttempt();
-                    newAttempt.setEmail(email);
-                    newAttempt.setAttempts(0);
-                    newAttempt.setLocked(false);
-                    return newAttempt;
-                });
+                .orElseGet(() -> new LoginAttempt(email, 0, false));
 
         if (attempt.isLocked()) {
             log.warn("Conta bloqueada para o e-mail: {}", email);
@@ -75,7 +75,7 @@ public class AuthController {
 
         User user = userRepository.findByEmail(email)
                 .orElseThrow(() -> {
-                    attempt.setAttempts(attempt.getAttempts() + 1);
+                    attempt.incrementAttempts();
                     if (attempt.getAttempts() >= 5) {
                         attempt.setLocked(true);
                     }
@@ -86,19 +86,18 @@ public class AuthController {
                 });
 
         if (passwordEncoder.matches(loginRequest.getPassword(), user.getPassword())) {
-            attempt.setAttempts(0);
-            attempt.setLocked(false);
+            attempt.resetAttempts();
             loginAttemptRepository.save(attempt);
 
             String accessToken = jwtTokenProvider.generateAccessToken(user);
-            String refreshToken = jwtTokenProvider.generateRefreshToken(user);
+            RefreshToken refreshToken = jwtTokenProvider.generateRefreshToken(user);
 
             log.info("Login bem-sucedido para o usuário: {}", user.getEmail());
             logAudit("LOGIN_SUCCESS", user.getEmail());
 
-            return ResponseEntity.ok(new AuthResponse(accessToken, refreshToken));
+            return ResponseEntity.ok(new AuthResponse(accessToken, refreshToken.getToken()));
         } else {
-            attempt.setAttempts(attempt.getAttempts() + 1);
+            attempt.incrementAttempts();
             if (attempt.getAttempts() >= 5) {
                 attempt.setLocked(true);
             }
@@ -110,16 +109,31 @@ public class AuthController {
     }
 
     @PostMapping("/refresh-token")
-    public ResponseEntity<?> refreshToken(@RequestBody String refreshToken) {
-        if (jwtTokenProvider.validateToken(refreshToken)) {
-            String email = jwtTokenProvider.extractEmail(refreshToken);
-            User user = userRepository.findByEmail(email)
-                    .orElseThrow(() -> new RuntimeException("Usuário não encontrado"));
+    public ResponseEntity<?> refreshToken(@RequestBody Map<String, String> request) {
+        String refreshToken = request.get("refreshToken");
 
-            String newAccessToken = jwtTokenProvider.generateAccessToken(user);
-            return ResponseEntity.ok(new AuthResponse(newAccessToken, refreshToken));
-        } else {
-            return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body("Refresh Token inválido");
+        RefreshToken tokenEntity = refreshTokenRepository.findByToken(refreshToken)
+                .orElseThrow(() -> new RuntimeException("Refresh Token não encontrado"));
+
+        if (tokenEntity.isRevoked() || tokenEntity.getExpiryDate().isBefore(LocalDateTime.now())) {
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body("Refresh Token expirado ou revogado");
         }
+
+        User user = tokenEntity.getUser();
+        String newAccessToken = jwtTokenProvider.generateAccessToken(user);
+        return ResponseEntity.ok(new AuthResponse(newAccessToken, refreshToken));
+    }
+
+    @PostMapping("/logout")
+    public ResponseEntity<?> logout(@RequestBody Map<String, String> request) {
+        String refreshTokenRequest = request.get("refreshToken");
+
+        RefreshToken refreshToken = refreshTokenRepository.findByToken(refreshTokenRequest)
+                .orElseThrow(() -> new RuntimeException("Refresh Token inválido"));
+
+        refreshToken.setRevoked(true);
+        refreshTokenRepository.save(refreshToken);
+
+        return ResponseEntity.ok("Logout realizado com sucesso.");
     }
 }
