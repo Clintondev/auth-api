@@ -1,0 +1,68 @@
+# 🔐 API de Autenticação
+
+Esta API fornece um sistema de autenticação completo utilizando **Spring Boot** e **JWT**, permitindo o gerenciamento seguro de usuários e sessões.  
+
+## 🛠️ Funcionalidades Principais
+- Registro e autenticação de usuários com **JWT**
+- Refresh Token para revalidação de sessão
+- Autenticação de Dois Fatores (**2FA**) via Google Authenticator
+- Recuperação e redefinição de senha via e-mail
+- Controle de acesso baseado em papéis (**RBAC**)
+- Proteção contra ataques de força bruta (**Rate Limiting**)
+
+## 🏗️ Tecnologias Utilizadas
+- **Java 17**
+- **Spring Boot 3.2.2**
+- **Spring Security**
+- **JWT (JSON Web Token)**
+- **PostgreSQL**
+- **Spring Data JPA**
+- **Google Authenticator**
+- **Bucket4j (Rate Limiting)**
+- **Swagger/OpenAPI**
+
+## 📄 Exemplo de `application.properties`
+```properties
+# Configurações do Banco de Dados
+spring.datasource.url=jdbc:postgresql://localhost:5432/auth_users
+spring.datasource.username=postgres
+spring.datasource.password=sua_senha
+
+# Configurações do JPA
+spring.jpa.hibernate.ddl-auto=update
+spring.jpa.show-sql=true
+spring.jpa.properties.hibernate.format_sql=true
+spring.jpa.database-platform=org.hibernate.dialect.PostgreSQLDialect
+
+# Configuração da Porta do Servidor
+server.port=8080
+
+# Configuração de Logs
+logging.level.root=INFO
+logging.level.com.auth.api=DEBUG
+logging.file.name=logs/api-auth.log
+logging.file.path=./
+
+# Configuração de E-mail (Outlook)
+spring.mail.host=smtp.office365.com
+spring.mail.port=587
+spring.mail.username=seu_email@email.com.br
+spring.mail.password=sua_senha
+spring.mail.properties.mail.smtp.auth=true
+spring.mail.properties.mail.smtp.starttls.enable=true
+spring.mail.from=seu_email@email.com.br
+
+# Configuração de E-mail (Gmail - se necessário)
+# spring.mail.host=smtp.gmail.com
+# spring.mail.port=587
+# spring.mail.username=seu_email@gmail.com
+# spring.mail.password=
+# spring.mail.properties.mail.smtp.auth=true
+# spring.mail.properties.mail.smtp.starttls.enable=true
+
+
+## 📄 Exemplo de `.env`
+```.env
+# Variaveis
+JWT_SECRET_KEY= 
+AES_SECRET_KEY= 
