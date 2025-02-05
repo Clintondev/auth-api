@@ -1,4 +1,4 @@
-package com.solubio.manutencao;
+package com.auth.api;
 
 import org.junit.jupiter.api.Test;
 import static org.junit.jupiter.api.Assertions.assertTrue;

@@ -1,5 +1,5 @@
 //src/main/java/exception/GlobalExceptionHandler.java
-package com.solubio.manutencao.exception;
+package com.auth.api.exception;
 
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;

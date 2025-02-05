@@ -8,17 +8,17 @@
     <parent>
         <groupId>org.springframework.boot</groupId>
         <artifactId>spring-boot-starter-parent</artifactId>
-        <version>3.2.2</version> <!-- Versão estável do Spring Boot -->
-        <relativePath/> <!-- Importante para builds locais -->
+        <version>3.2.2</version> 
+        <relativePath/> 
     </parent>
 
-    <groupId>com.solubio.manutencao</groupId>
-    <artifactId>solubio-manutencao-api</artifactId>
+    <groupId>com.auth.api</groupId>
+    <artifactId>auth-api</artifactId>
     <version>1.0-SNAPSHOT</version>
     <packaging>jar</packaging>
 
-    <name>solubio-manutencao-api</name>
-    <description>API para Manutenção Industrial - Solubio</description>
+    <name>auth-api</name>
+    <description>API de Autenticação</description>
     <url>http://maven.apache.org</url>
 
     <properties>
@@ -135,6 +135,17 @@
         <groupId>com.google.zxing</groupId>
         <artifactId>javase</artifactId>
         <version>3.5.1</version>
+    </dependency>
+    <dependency>
+        <groupId>com.github.vladimir-bukhtoyarov</groupId>
+        <artifactId>bucket4j-core</artifactId>
+        <version>7.6.0</version>
+    </dependency>
+
+    <dependency>
+        <groupId>org.springdoc</groupId>
+        <artifactId>springdoc-openapi-starter-webmvc-ui</artifactId>
+        <version>2.1.0</version>
     </dependency>
 </dependencies>
     <build>
