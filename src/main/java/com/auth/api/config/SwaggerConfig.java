@@ -20,7 +20,7 @@ public class SwaggerConfig {
                         .description("Documentação da API.")
                         .contact(new Contact()
                                 .name("Equipe api")
-                                .email("helpdesk@api.agr.br")
+                                .email("seu_email@email.com.br")
                                 .url("https://www.api.agr.br"))
                         .license(new License()
                                 .name("Licença Apache 2.0")
