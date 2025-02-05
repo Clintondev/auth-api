@@ -32,11 +32,15 @@ public class User {
     @Column(nullable = false)
     private String password;
 
+    @Column(name = "two_factor_enabled")
+    private Boolean twoFactorEnabled = false;
+
+    @Column(name = "two_factor_secret")
+    private String twoFactorSecret;
+
     private String telefone;
     private String setor;
     private String cargo;
-
-
 
     @ManyToMany(fetch = FetchType.EAGER)
     @JoinTable(
@@ -45,4 +49,8 @@ public class User {
         inverseJoinColumns = @JoinColumn(name = "role_id", referencedColumnName = "id")
     )
     private Set<Role> roles;
+
+    public boolean isTwoFactorEnabled() {
+        return Boolean.TRUE.equals(twoFactorEnabled);
+    }
 }

@@ -13,4 +13,6 @@ public class LoginRequest {
 
     @NotBlank(message = "A senha é obrigatória.")
     private String password;
+
+    private Integer twoFactorCode; 
 }

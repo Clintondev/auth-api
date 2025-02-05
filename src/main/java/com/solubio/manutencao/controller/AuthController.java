@@ -23,6 +23,8 @@ import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.web.bind.annotation.*;
 import jakarta.validation.Valid;
 import jakarta.servlet.http.HttpServletRequest;
+import com.solubio.manutencao.service.TwoFactorAuthService;
+import org.springframework.security.access.prepost.PreAuthorize;
 
 import java.time.LocalDateTime;
 import java.util.Map;
@@ -60,6 +62,9 @@ public class AuthController {
     @Autowired
     private HttpServletRequest request;
 
+    @Autowired
+    private TwoFactorAuthService twoFactorAuthService;
+
     private void logAudit(String action, String userEmail) {
         AuditLog auditLog = new AuditLog();
         auditLog.setUserEmail(userEmail);
@@ -96,6 +101,32 @@ public class AuthController {
                 });
 
         if (passwordEncoder.matches(loginRequest.getPassword(), user.getPassword())) {
+            if (user.isTwoFactorEnabled()) {
+                int max2faAttempts = 5;
+                LoginAttempt twoFactorAttempt = loginAttemptRepository.findByEmail(email)
+                        .orElseGet(() -> new LoginAttempt(email, 0, false));
+
+                if (loginRequest.getTwoFactorCode() == null) {
+                    log.warn("Código 2FA necessário para o e-mail: {}", email);
+                    return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body("Código 2FA necessário.");
+                }
+
+                if (twoFactorAttempt.getAttempts() >= max2faAttempts) {
+                    log.warn("Múltiplas tentativas de 2FA falhadas para o e-mail: {}", email);
+                    return ResponseEntity.status(HttpStatus.LOCKED).body("Múltiplas tentativas de 2FA falhadas. Tente novamente mais tarde.");
+                }
+
+                boolean isCodeValid = twoFactorAuthService.verifyCode(user.getTwoFactorSecret(), loginRequest.getTwoFactorCode());
+                if (!isCodeValid) {
+                    twoFactorAttempt.incrementAttempts();
+                    loginAttemptRepository.save(twoFactorAttempt);
+                    log.warn("Código 2FA inválido para o e-mail: {}", email);
+                    return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body("Código 2FA inválido.");
+                }
+                twoFactorAttempt.resetAttempts();
+                loginAttemptRepository.save(twoFactorAttempt);
+            }
+
             attempt.resetAttempts();
             loginAttemptRepository.save(attempt);
 
@@ -117,6 +148,7 @@ public class AuthController {
             return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body("Credenciais inválidas");
         }
     }
+
 
     @PostMapping("/refresh-token")
     public ResponseEntity<?> refreshToken(@RequestBody Map<String, String> request) {
@@ -185,5 +217,60 @@ public class AuthController {
         passwordResetTokenRepository.delete(resetToken);
 
         return ResponseEntity.ok("Senha redefinida com sucesso.");
+    }
+    @PreAuthorize("hasRole('ADMIN') or authentication.name == @userRepository.findById(#id).get().email")
+    @PostMapping("/enable-2fa/{id}")
+    public ResponseEntity<?> enableTwoFactorAuth(@PathVariable Long id) throws Exception {
+        User user = userRepository.findById(id)
+                .orElseThrow(() -> new RuntimeException("Usuário não encontrado"));
+
+        String secret = twoFactorAuthService.generateSecretKey();
+        user.setTwoFactorSecret(secret);
+        user.setTwoFactorEnabled(true);
+        userRepository.save(user);
+
+        String qrCode = twoFactorAuthService.generateQrCode(user.getEmail(), secret);
+
+        return ResponseEntity.ok(Map.of(
+            "message", "2FA habilitado com sucesso para o usuário: " + user.getEmail(),
+            "qrCode", qrCode,
+            "secret", secret
+        ));
+    }
+
+    @PreAuthorize("hasRole('ADMIN') or authentication.name == @userRepository.findById(#id).get().email")    
+    @DeleteMapping("/disable-2fa/{id}")
+    public ResponseEntity<?> disableTwoFactorAuth(@PathVariable Long id) {
+        User user = userRepository.findById(id)
+                .orElseThrow(() -> new RuntimeException("Usuário não encontrado"));
+
+        user.setTwoFactorEnabled(false);
+        user.setTwoFactorSecret(null);  
+        userRepository.save(user);
+
+        return ResponseEntity.ok("Autenticação de dois fatores desativada com sucesso para o usuário: " + user.getEmail());
+    }
+
+    @PreAuthorize("authentication.name == @userRepository.findById(#id).get().email")
+    @GetMapping("/2fa-info/{id}")
+    public ResponseEntity<?> getTwoFactorAuthInfo(@PathVariable Long id) {
+        User user = userRepository.findById(id)
+                .orElseThrow(() -> new RuntimeException("Usuário não encontrado"));
+
+        if (!user.isTwoFactorEnabled()) {
+            return ResponseEntity.status(HttpStatus.BAD_REQUEST).body("2FA não está habilitado para este usuário.");
+        }
+
+        String qrCode;
+        try {
+            qrCode = twoFactorAuthService.generateQrCode(user.getEmail(), user.getTwoFactorSecret());
+        } catch (Exception e) {
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body("Erro ao gerar o QR Code.");
+        }
+
+        return ResponseEntity.ok(Map.of(
+            "qrCode", qrCode,
+            "secret", user.getTwoFactorSecret()
+        ));
     }
 }

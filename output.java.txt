@@ -1,0 +1,1363 @@
+// ==== /home/azureuser/projects/solubio-manutencao-api/src/main/java/com/solubio/manutencao/SolubioManutencaoApiApplication.java ====
+// src/main/java/com/solubio/manutencao/SolubioManutencaoApiApplication.java
+package com.solubio.manutencao;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.scheduling.annotation.EnableAsync;
+
+@SpringBootApplication
+@EnableAsync
+public class SolubioManutencaoApiApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(SolubioManutencaoApiApplication.class, args);
+    }
+}
+
+// ==== /home/azureuser/projects/solubio-manutencao-api/src/main/java/com/solubio/manutencao/config/DatabaseInitializer.java ====
+//src/main/java/com/solubio/manutencao/config/DatabaseInitializer.java
+package com.solubio.manutencao.config;
+
+import jakarta.annotation.PostConstruct;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.stereotype.Component;
+
+@Component
+public class DatabaseInitializer {
+
+    @Autowired
+    private JdbcTemplate jdbcTemplate;
+
+    @PostConstruct
+    public void init() {
+        String createAuditLogTriggerTable = """
+            CREATE TABLE IF NOT EXISTS audit_log_trigger (
+                id SERIAL PRIMARY KEY,
+                table_name VARCHAR(50),
+                operation VARCHAR(10),
+                old_data JSONB,
+                new_data JSONB,
+                changed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """;
+        jdbcTemplate.execute(createAuditLogTriggerTable);
+
+        String createAuditTriggerFunction = """
+            CREATE OR REPLACE FUNCTION audit_trigger_function()
+            RETURNS TRIGGER AS $$
+            BEGIN
+                INSERT INTO audit_log_trigger (table_name, operation, old_data, new_data)
+                VALUES (
+                    TG_TABLE_NAME,
+                    TG_OP,
+                    row_to_json(OLD),
+                    row_to_json(NEW)
+                );
+                RETURN NEW;
+            END;
+            $$ LANGUAGE plpgsql;
+        """;
+        jdbcTemplate.execute(createAuditTriggerFunction);
+
+        String createUserAuditTrigger = """
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_trigger WHERE tgname = 'user_audit_trigger'
+                ) THEN
+                    CREATE TRIGGER user_audit_trigger
+                    AFTER INSERT OR UPDATE OR DELETE ON users
+                    FOR EACH ROW
+                    EXECUTE FUNCTION audit_trigger_function();
+                END IF;
+            END;
+            $$;
+        """;
+        jdbcTemplate.execute(createUserAuditTrigger);
+    }
+}
+
+// ==== /home/azureuser/projects/solubio-manutencao-api/src/main/java/com/solubio/manutencao/config/SecurityConfig.java ====
+//src/main/java/com/solubio/manutencao/config/SecurityConfig.java
+package com.solubio.manutencao.config;
+
+import com.solubio.manutencao.security.JwtAuthenticationFilter;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.security.authentication.AuthenticationManager;
+import org.springframework.security.config.annotation.authentication.configuration.AuthenticationConfiguration;
+import org.springframework.security.config.annotation.method.configuration.EnableMethodSecurity;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.config.http.SessionCreationPolicy;
+import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
+import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter;
+import org.springframework.security.access.hierarchicalroles.RoleHierarchy;
+import org.springframework.security.access.hierarchicalroles.RoleHierarchyImpl;
+
+@Configuration
+@EnableMethodSecurity(prePostEnabled = true)
+public class SecurityConfig {
+
+    private final JwtAuthenticationFilter jwtAuthenticationFilter;
+
+    public SecurityConfig(JwtAuthenticationFilter jwtAuthenticationFilter) {
+        this.jwtAuthenticationFilter = jwtAuthenticationFilter;
+    }
+
+    @Bean
+    public PasswordEncoder passwordEncoder() {
+        return new BCryptPasswordEncoder();
+    }
+
+    @Bean
+    public RoleHierarchy roleHierarchy() {
+        RoleHierarchyImpl roleHierarchy = new RoleHierarchyImpl();
+        String hierarchy = """
+            ADMIN > PCM
+            PCM > COORDENADOR
+            COORDENADOR > MANUTENTOR
+            MANUTENTOR > SOLICITANTE
+        """;
+        roleHierarchy.setHierarchy(hierarchy);
+        return roleHierarchy;
+    }
+
+    @Bean
+    public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
+        http
+            .csrf(csrf -> csrf.disable())
+            .authorizeHttpRequests(auth -> auth
+                .requestMatchers("/auth/**", "/auth/refresh-token").permitAll()               
+                .requestMatchers("/users/list", "/users/{id}").authenticated() 
+                .requestMatchers("/users/create", "/users/update/**", "/users/delete/**")
+                    .hasAnyRole("PCM", "ADMIN", "COORDENADOR")        
+                .anyRequest().authenticated()                        
+            )
+            .sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+            .addFilterBefore(jwtAuthenticationFilter, UsernamePasswordAuthenticationFilter.class);
+
+        return http.build();
+    }
+
+    @Bean
+    public AuthenticationManager authenticationManager(AuthenticationConfiguration authenticationConfiguration) throws Exception {
+        return authenticationConfiguration.getAuthenticationManager();
+    }
+}
+
+
+// ==== /home/azureuser/projects/solubio-manutencao-api/src/main/java/com/solubio/manutencao/security/JwtTokenProvider.java ====
+//src/main/java/com/solubio/manutencao/security/JwtTokenProvider.java
+package com.solubio.manutencao.security;
+
+import com.solubio.manutencao.model.RefreshToken;
+import com.solubio.manutencao.model.User;
+import com.solubio.manutencao.repository.RefreshTokenRepository;
+import io.github.cdimascio.dotenv.Dotenv;
+import org.springframework.stereotype.Component;
+
+import java.time.LocalDateTime;
+import java.util.UUID;
+
+@Component
+public class JwtTokenProvider {
+
+    private final Dotenv dotenv = Dotenv.load();
+    private final String secretKey = dotenv.get("JWT_SECRET_KEY");
+    private final long accessTokenExpiration = 900_000;  // 15 minutos
+    private final long refreshTokenExpiration = 7 * 24 * 60 * 60 * 1000;  // 7 dias
+
+    private final RefreshTokenRepository refreshTokenRepository;
+
+    public JwtTokenProvider(RefreshTokenRepository refreshTokenRepository) {
+        this.refreshTokenRepository = refreshTokenRepository;
+    }
+
+    public String generateAccessToken(User user) {
+        return io.jsonwebtoken.Jwts.builder()
+                .setSubject(user.getEmail())
+                .setIssuedAt(new java.util.Date())
+                .setExpiration(new java.util.Date(System.currentTimeMillis() + accessTokenExpiration))
+                .signWith(io.jsonwebtoken.SignatureAlgorithm.HS256, secretKey.getBytes())
+                .compact();
+    }
+
+    public RefreshToken generateRefreshToken(User user) {
+        RefreshToken refreshToken = new RefreshToken();
+        refreshToken.setToken(UUID.randomUUID().toString());
+        refreshToken.setUser(user);
+        refreshToken.setExpiryDate(LocalDateTime.now().plusDays(7));
+        refreshToken.setRevoked(false);
+        return refreshTokenRepository.save(refreshToken);
+    }
+
+    public boolean validateToken(String token) {
+        try {
+            io.jsonwebtoken.Jwts.parser().setSigningKey(secretKey.getBytes()).parseClaimsJws(token);
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    public String extractEmail(String token) {
+        return io.jsonwebtoken.Jwts.parser()
+                .setSigningKey(secretKey.getBytes())
+                .parseClaimsJws(token)
+                .getBody()
+                .getSubject();
+    }
+}
+
+// ==== /home/azureuser/projects/solubio-manutencao-api/src/main/java/com/solubio/manutencao/security/JwtAuthenticationFilter.java ====
+//src/main/java/com/solubio/manutencao/security/JwtAuthenticationFilter.java
+package com.solubio.manutencao.security;
+
+import com.solubio.manutencao.repository.RevokedTokenRepository;
+import io.jsonwebtoken.Claims;
+import io.jsonwebtoken.Jwts;
+import io.github.cdimascio.dotenv.Dotenv;
+import jakarta.servlet.FilterChain;
+import jakarta.servlet.ServletException;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.security.core.userdetails.UserDetails;
+import org.springframework.security.core.userdetails.UserDetailsService;
+import org.springframework.security.web.authentication.WebAuthenticationDetailsSource;
+import org.springframework.stereotype.Component;
+import org.springframework.web.filter.OncePerRequestFilter;
+
+import java.io.IOException;
+import java.util.Date;
+import java.util.List;
+import java.util.Locale;
+import java.util.stream.Collectors;
+
+@Component
+public class JwtAuthenticationFilter extends OncePerRequestFilter {
+
+    private final UserDetailsService userDetailsService;
+    private final RevokedTokenRepository revokedTokenRepository;
+    private final Dotenv dotenv = Dotenv.load();
+    private final String secretKey = dotenv.get("JWT_SECRET_KEY");
+
+    public JwtAuthenticationFilter(UserDetailsService userDetailsService, RevokedTokenRepository revokedTokenRepository) {
+        this.userDetailsService = userDetailsService;
+        this.revokedTokenRepository = revokedTokenRepository;
+    }
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest request,
+                                    HttpServletResponse response,
+                                    FilterChain filterChain) throws ServletException, IOException {
+
+        final String authHeader = request.getHeader("Authorization");
+
+        if (authHeader == null || !authHeader.startsWith("Bearer ")) {
+            filterChain.doFilter(request, response);
+            return;
+        }
+
+        final String token = authHeader.substring(7);
+
+        // Check if the token is revoked
+        if (revokedTokenRepository.existsByToken(token)) {
+            response.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
+            response.getWriter().write("Token revogado. Faça login novamente.");
+            return;
+        }
+
+        final String email = extractEmail(token);
+
+        if (email != null && SecurityContextHolder.getContext().getAuthentication() == null) {
+            UserDetails userDetails = userDetailsService.loadUserByUsername(email);
+
+            if (validateToken(token, userDetails)) {
+                Claims claims = Jwts.parser()
+                        .setSigningKey(secretKey.getBytes())
+                        .parseClaimsJws(token)
+                        .getBody();
+                List<String> tokenRoles = claims.get("roles") != null
+                    ? ((List<?>) claims.get("roles"))
+                        .stream()
+                        .filter(role -> role instanceof String)
+                        .map(role -> ((String) role).toUpperCase(Locale.ROOT))
+                        .collect(Collectors.toList())
+                    : List.of();  
+
+                List<String> userRoles = userDetails.getAuthorities()
+                        .stream()
+                        .map(auth -> auth.getAuthority().replace("ROLE_", "").toUpperCase(Locale.ROOT))
+                        .collect(Collectors.toList());
+
+                if (!userRoles.containsAll(tokenRoles)) {
+                    response.setStatus(HttpServletResponse.SC_FORBIDDEN);
+                    response.getWriter().write("Token inválido: roles não correspondem aos do banco de dados.");
+                    return;
+                }
+
+                UsernamePasswordAuthenticationToken authentication = new UsernamePasswordAuthenticationToken(
+                        userDetails, null, userDetails.getAuthorities()
+                );
+                authentication.setDetails(new WebAuthenticationDetailsSource().buildDetails(request));
+                SecurityContextHolder.getContext().setAuthentication(authentication);
+            }
+        }
+
+        filterChain.doFilter(request, response);
+    }
+
+    private String extractEmail(String token) {
+        Claims claims = Jwts.parser()
+                .setSigningKey(secretKey.getBytes())
+                .parseClaimsJws(token)
+                .getBody();
+        return claims.getSubject();
+    }
+
+    private boolean validateToken(String token, UserDetails userDetails) {
+        try {
+            final String email = extractEmail(token);
+            return email.equals(userDetails.getUsername()) && !isTokenExpired(token);
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private boolean isTokenExpired(String token) {
+        final Date expiration = Jwts.parser()
+                .setSigningKey(secretKey.getBytes())
+                .parseClaimsJws(token)
+                .getBody()
+                .getExpiration();
+        return expiration.before(new Date());
+    }
+}
+
+// ==== /home/azureuser/projects/solubio-manutencao-api/src/main/java/com/solubio/manutencao/controller/UsersController.java ====
+//src/main/java/com/solubio/manutencao/controller/UsersController.java
+package com.solubio.manutencao.controller;
+
+import com.solubio.manutencao.model.AuditLog;
+import com.solubio.manutencao.model.Role;
+import com.solubio.manutencao.model.User;
+import com.solubio.manutencao.service.UserService;
+import com.solubio.manutencao.repository.AuditLogRepository;
+import com.solubio.manutencao.repository.RoleRepository;
+import com.solubio.manutencao.service.AuditService;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.http.ResponseEntity;
+import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.security.access.prepost.PreAuthorize;
+import jakarta.servlet.http.HttpServletRequest;
+
+import java.util.List;
+import java.util.Optional;
+import java.util.Set;
+import java.util.stream.Collectors;
+
+@RestController
+@RequestMapping("/users")
+@Slf4j
+public class UsersController {
+
+    @Autowired
+    private UserService userService;
+
+    @Autowired
+    private RoleRepository roleRepository;
+
+    @Autowired
+    private AuditLogRepository auditLogRepository;
+
+    @Autowired
+    private PasswordEncoder passwordEncoder;
+
+    @Autowired
+    private HttpServletRequest request;
+
+    @Autowired
+    private AuditService auditService;
+
+    private void logAudit(String action, String entity, Long entityId) {
+        String ipAddress = request.getRemoteAddr();
+        String userAgent = request.getHeader("User-Agent");
+
+        auditService.logAudit(action, entity, entityId, getCurrentUserEmail(), ipAddress, userAgent);
+    }
+
+    private String getCurrentUserEmail() {
+        return SecurityContextHolder.getContext().getAuthentication().getName();
+    }
+
+    @PreAuthorize("hasAnyRole('ADMIN', 'PCM', 'COORDENADOR')")
+    @PostMapping("/create")
+    public ResponseEntity<?> createUser(@RequestBody User user) {
+        String currentUserEmail = getCurrentUserEmail();
+        log.info("Usuário {} tentando criar um novo usuário: {}", currentUserEmail, user.getEmail());
+
+        if (userService.findByEmail(user.getEmail()).isPresent()) {
+            log.warn("Tentativa de criar usuário com e-mail já existente: {}", user.getEmail());
+            return ResponseEntity.badRequest().body("E-mail já está em uso.");
+        }
+
+        user.setPassword(passwordEncoder.encode(user.getPassword()));
+
+        if (user.getRoles() != null && !user.getRoles().isEmpty()) {
+            Set<Role> validRoles = user.getRoles().stream()
+                    .map(role -> roleRepository.findByName(role.getName()))
+                    .filter(role -> role != null)
+                    .collect(Collectors.toSet());
+
+            if (validRoles.isEmpty()) {
+                return ResponseEntity.badRequest().body("Nenhuma role válida foi fornecida.");
+            }
+            user.setRoles(validRoles);
+        } else {
+            Role defaultRole = roleRepository.findByName("SOLICITANTE");
+            user.setRoles(Set.of(defaultRole));
+        }
+
+        userService.save(user);
+        log.info("Usuário {} criado com sucesso pelo usuário {}", user.getEmail(), currentUserEmail);
+        logAudit("CREATE", "User", user.getId());
+        return ResponseEntity.ok("Usuário criado com sucesso.");
+    }
+
+    @PreAuthorize("hasAnyRole('ADMIN', 'PCM', 'COORDENADOR')")
+    @PutMapping("/update/{id}")
+    public ResponseEntity<?> updateUser(@PathVariable Long id, @RequestBody User updatedUser) {
+        String currentUserEmail = getCurrentUserEmail();
+        log.info("Usuário {} tentando atualizar o usuário ID: {}", currentUserEmail, id);
+
+        Optional<User> optionalUser = userService.findById(id);
+        if (optionalUser.isPresent()) {
+            User user = optionalUser.get();
+            user.setNome(updatedUser.getNome());
+            user.setEmail(updatedUser.getEmail());
+            userService.save(user);
+            log.info("Usuário ID: {} atualizado com sucesso por {}", id, currentUserEmail);
+            logAudit("UPDATE", "User", user.getId());
+            return ResponseEntity.ok("Usuário atualizado com sucesso.");
+        } else {
+            log.warn("Tentativa de atualização falhou. Usuário ID: {} não encontrado.", id);
+            return ResponseEntity.notFound().build();
+        }
+    }
+
+    @PreAuthorize("hasAnyRole('ADMIN', 'PCM', 'COORDENADOR')")
+    @DeleteMapping("/delete/{id}")
+    public ResponseEntity<?> deleteUser(@PathVariable Long id) {
+        String currentUserEmail = getCurrentUserEmail();
+        log.info("Usuário {} tentando deletar o usuário ID: {}", currentUserEmail, id);
+
+        if (userService.existsById(id)) {
+            userService.deleteById(id);
+            log.info("Usuário ID: {} deletado com sucesso por {}", id, currentUserEmail);
+            logAudit("DELETE", "User", id);
+            return ResponseEntity.ok("Usuário deletado com sucesso.");
+        } else {
+            log.warn("Tentativa de exclusão falhou. Usuário ID: {} não encontrado.", id);
+            return ResponseEntity.notFound().build();
+        }
+    }
+
+    @GetMapping("/list")
+    public List<User> listAllUsers() {
+        log.info("Listagem de todos os usuários solicitada por {}", getCurrentUserEmail());
+        return userService.findAll().stream()
+                .map(user -> {
+                    user.setPassword(null);
+                    return user;
+                })
+                .collect(Collectors.toList());
+    }
+
+    @GetMapping("/{id}")
+    public ResponseEntity<?> getUserById(@PathVariable Long id) {
+        log.info("Usuário {} solicitou detalhes do usuário ID: {}", getCurrentUserEmail(), id);
+        Optional<User> user = userService.findById(id);
+        return user.map(u -> {
+            u.setPassword(null);
+            return ResponseEntity.ok(u);
+        }).orElseGet(() -> {
+            log.warn("Usuário ID: {} não encontrado.", id);
+            return ResponseEntity.notFound().build();
+        });
+    }
+}
+
+
+// ==== /home/azureuser/projects/solubio-manutencao-api/src/main/java/com/solubio/manutencao/controller/AuthController.java ====
+//src/main/java/com/solubio/manutencao/controller/AuthController.java
+package com.solubio.manutencao.controller;
+
+import com.solubio.manutencao.model.AuditLog;
+import com.solubio.manutencao.model.User;
+import com.solubio.manutencao.model.AuthResponse;
+import com.solubio.manutencao.model.LoginRequest;
+import com.solubio.manutencao.model.RefreshToken;
+import com.solubio.manutencao.model.PasswordResetToken;
+import com.solubio.manutencao.repository.AuditLogRepository;
+import com.solubio.manutencao.repository.UserRepository;
+import com.solubio.manutencao.repository.LoginAttemptRepository;
+import com.solubio.manutencao.repository.RefreshTokenRepository;
+import com.solubio.manutencao.repository.PasswordResetTokenRepository;
+import com.solubio.manutencao.service.EmailService;
+import com.solubio.manutencao.model.LoginAttempt;
+import com.solubio.manutencao.security.JwtTokenProvider;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.web.bind.annotation.*;
+import jakarta.validation.Valid;
+import jakarta.servlet.http.HttpServletRequest;
+import com.solubio.manutencao.service.TwoFactorAuthService;
+import org.springframework.security.access.prepost.PreAuthorize;
+
+import java.time.LocalDateTime;
+import java.util.Map;
+import java.util.UUID;
+
+@RestController
+@RequestMapping("/auth")
+@Slf4j
+public class AuthController {
+
+    @Autowired
+    private UserRepository userRepository;
+
+    @Autowired
+    private PasswordEncoder passwordEncoder;
+
+    @Autowired
+    private JwtTokenProvider jwtTokenProvider;
+
+    @Autowired
+    private AuditLogRepository auditLogRepository;
+
+    @Autowired
+    private LoginAttemptRepository loginAttemptRepository;
+
+    @Autowired
+    private RefreshTokenRepository refreshTokenRepository;
+
+    @Autowired
+    private PasswordResetTokenRepository passwordResetTokenRepository;
+
+    @Autowired
+    private EmailService emailService;
+
+    @Autowired
+    private HttpServletRequest request;
+
+    @Autowired
+    private TwoFactorAuthService twoFactorAuthService;
+
+    private void logAudit(String action, String userEmail) {
+        AuditLog auditLog = new AuditLog();
+        auditLog.setUserEmail(userEmail);
+        auditLog.setAction(action);
+        auditLog.setEntity("Authentication");
+        auditLog.setIpAddress(request.getRemoteAddr());
+        auditLog.setUserAgent(request.getHeader("User-Agent"));
+        auditLogRepository.save(auditLog);
+    }
+
+    @PostMapping("/login")
+    public ResponseEntity<?> login(@Valid @RequestBody LoginRequest loginRequest) {
+        log.info("Tentativa de login para o e-mail: {}", loginRequest.getEmail());
+
+        String email = loginRequest.getEmail();
+        LoginAttempt attempt = loginAttemptRepository.findByEmail(email)
+                .orElseGet(() -> new LoginAttempt(email, 0, false));
+
+        if (attempt.isLocked()) {
+            log.warn("Conta bloqueada para o e-mail: {}", email);
+            return ResponseEntity.status(HttpStatus.LOCKED).body("Conta bloqueada devido a múltiplas tentativas de login.");
+        }
+
+        User user = userRepository.findByEmail(email)
+                .orElseThrow(() -> {
+                    attempt.incrementAttempts();
+                    if (attempt.getAttempts() >= 5) {
+                        attempt.setLocked(true);
+                    }
+                    loginAttemptRepository.save(attempt);
+                    log.warn("Tentativa de login falhou para o e-mail: {}", email);
+                    logAudit("LOGIN_FAILED", email);
+                    return new RuntimeException("Credenciais inválidas");
+                });
+
+        if (passwordEncoder.matches(loginRequest.getPassword(), user.getPassword())) {
+            if (user.isTwoFactorEnabled()) {
+                int max2faAttempts = 5;
+                LoginAttempt twoFactorAttempt = loginAttemptRepository.findByEmail(email)
+                        .orElseGet(() -> new LoginAttempt(email, 0, false));
+
+                if (loginRequest.getTwoFactorCode() == null) {
+                    log.warn("Código 2FA necessário para o e-mail: {}", email);
+                    return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body("Código 2FA necessário.");
+                }
+
+                if (twoFactorAttempt.getAttempts() >= max2faAttempts) {
+                    log.warn("Múltiplas tentativas de 2FA falhadas para o e-mail: {}", email);
+                    return ResponseEntity.status(HttpStatus.LOCKED).body("Múltiplas tentativas de 2FA falhadas. Tente novamente mais tarde.");
+                }
+
+                boolean isCodeValid = twoFactorAuthService.verifyCode(user.getTwoFactorSecret(), loginRequest.getTwoFactorCode());
+                if (!isCodeValid) {
+                    twoFactorAttempt.incrementAttempts();
+                    loginAttemptRepository.save(twoFactorAttempt);
+                    log.warn("Código 2FA inválido para o e-mail: {}", email);
+                    return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body("Código 2FA inválido.");
+                }
+                twoFactorAttempt.resetAttempts();
+                loginAttemptRepository.save(twoFactorAttempt);
+            }
+
+            attempt.resetAttempts();
+            loginAttemptRepository.save(attempt);
+
+            String accessToken = jwtTokenProvider.generateAccessToken(user);
+            RefreshToken refreshToken = jwtTokenProvider.generateRefreshToken(user);
+
+            log.info("Login bem-sucedido para o usuário: {}", user.getEmail());
+            logAudit("LOGIN_SUCCESS", user.getEmail());
+
+            return ResponseEntity.ok(new AuthResponse(accessToken, refreshToken.getToken()));
+        } else {
+            attempt.incrementAttempts();
+            if (attempt.getAttempts() >= 5) {
+                attempt.setLocked(true);
+            }
+            loginAttemptRepository.save(attempt);
+            log.warn("Senha inválida para o e-mail: {}", email);
+            logAudit("LOGIN_FAILED", email);
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body("Credenciais inválidas");
+        }
+    }
+
+
+    @PostMapping("/refresh-token")
+    public ResponseEntity<?> refreshToken(@RequestBody Map<String, String> request) {
+        String refreshToken = request.get("refreshToken");
+
+        RefreshToken tokenEntity = refreshTokenRepository.findByToken(refreshToken)
+                .orElseThrow(() -> new RuntimeException("Refresh Token não encontrado"));
+
+        if (tokenEntity.isRevoked() || tokenEntity.getExpiryDate().isBefore(LocalDateTime.now())) {
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body("Refresh Token expirado ou revogado");
+        }
+
+        User user = tokenEntity.getUser();
+        String newAccessToken = jwtTokenProvider.generateAccessToken(user);
+        return ResponseEntity.ok(new AuthResponse(newAccessToken, refreshToken));
+    }
+
+    @PostMapping("/logout")
+    public ResponseEntity<?> logout(@RequestBody Map<String, String> request) {
+        String refreshTokenRequest = request.get("refreshToken");
+
+        RefreshToken refreshToken = refreshTokenRepository.findByToken(refreshTokenRequest)
+                .orElseThrow(() -> new RuntimeException("Refresh Token inválido"));
+
+        refreshToken.setRevoked(true);
+        refreshTokenRepository.save(refreshToken);
+
+        return ResponseEntity.ok("Logout realizado com sucesso.");
+    }
+
+    @PostMapping("/forgot-password")
+    public ResponseEntity<?> forgotPassword(@RequestBody Map<String, String> request) {
+        String email = request.get("email");
+        User user = userRepository.findByEmail(email)
+                .orElseThrow(() -> new RuntimeException("Usuário não encontrado."));
+
+        String token = UUID.randomUUID().toString();
+
+        PasswordResetToken resetToken = passwordResetTokenRepository.findByUser(user)
+                .orElseGet(() -> new PasswordResetToken());
+
+        resetToken.setToken(token);
+        resetToken.setUser(user);
+        resetToken.setExpiryDate(LocalDateTime.now().plusHours(1));
+        passwordResetTokenRepository.save(resetToken);
+
+        emailService.sendPasswordResetEmail(user.getEmail(), token);
+        return ResponseEntity.ok("E-mail de redefinição de senha enviado.");
+    }
+
+    @PostMapping("/reset-password")
+    public ResponseEntity<?> resetPassword(@RequestBody Map<String, String> request) {
+        String token = request.get("token");
+        String newPassword = request.get("newPassword");
+
+        PasswordResetToken resetToken = passwordResetTokenRepository.findByToken(token)
+                .orElseThrow(() -> new RuntimeException("Token inválido ou expirado."));
+
+        if (resetToken.getExpiryDate().isBefore(LocalDateTime.now())) {
+            return ResponseEntity.status(HttpStatus.BAD_REQUEST).body("Token expirado.");
+        }
+
+        User user = resetToken.getUser();
+        user.setPassword(passwordEncoder.encode(newPassword));
+        userRepository.save(user);
+        passwordResetTokenRepository.delete(resetToken);
+
+        return ResponseEntity.ok("Senha redefinida com sucesso.");
+    }
+    @PreAuthorize("hasRole('ADMIN') or authentication.name == @userRepository.findById(#id).get().email")
+    @PostMapping("/enable-2fa/{id}")
+    public ResponseEntity<?> enableTwoFactorAuth(@PathVariable Long id) throws Exception {
+        User user = userRepository.findById(id)
+                .orElseThrow(() -> new RuntimeException("Usuário não encontrado"));
+
+        String secret = twoFactorAuthService.generateSecretKey();
+        user.setTwoFactorSecret(secret);
+        user.setTwoFactorEnabled(true);
+        userRepository.save(user);
+
+        String qrCode = twoFactorAuthService.generateQrCode(user.getEmail(), secret);
+
+        return ResponseEntity.ok(Map.of(
+            "message", "2FA habilitado com sucesso para o usuário: " + user.getEmail(),
+            "qrCode", qrCode,
+            "secret", secret
+        ));
+    }
+
+    @PreAuthorize("hasRole('ADMIN') or authentication.name == @userRepository.findById(#id).get().email")    
+    @DeleteMapping("/disable-2fa/{id}")
+    public ResponseEntity<?> disableTwoFactorAuth(@PathVariable Long id) {
+        User user = userRepository.findById(id)
+                .orElseThrow(() -> new RuntimeException("Usuário não encontrado"));
+
+        user.setTwoFactorEnabled(false);
+        user.setTwoFactorSecret(null);  
+        userRepository.save(user);
+
+        return ResponseEntity.ok("Autenticação de dois fatores desativada com sucesso para o usuário: " + user.getEmail());
+    }
+
+    @PreAuthorize("authentication.name == @userRepository.findById(#id).get().email")
+    @GetMapping("/2fa-info/{id}")
+    public ResponseEntity<?> getTwoFactorAuthInfo(@PathVariable Long id) {
+        User user = userRepository.findById(id)
+                .orElseThrow(() -> new RuntimeException("Usuário não encontrado"));
+
+        if (!user.isTwoFactorEnabled()) {
+            return ResponseEntity.status(HttpStatus.BAD_REQUEST).body("2FA não está habilitado para este usuário.");
+        }
+
+        String qrCode;
+        try {
+            qrCode = twoFactorAuthService.generateQrCode(user.getEmail(), user.getTwoFactorSecret());
+        } catch (Exception e) {
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body("Erro ao gerar o QR Code.");
+        }
+
+        return ResponseEntity.ok(Map.of(
+            "qrCode", qrCode,
+            "secret", user.getTwoFactorSecret()
+        ));
+    }
+}
+
+
+// ==== /home/azureuser/projects/solubio-manutencao-api/src/main/java/com/solubio/manutencao/model/LoginRequest.java ====
+//src/main/java/com/solubio/manutencao/model/LoginRequest.java
+package com.solubio.manutencao.model;
+
+import lombok.Data;
+import jakarta.validation.constraints.Email;
+import jakarta.validation.constraints.NotBlank;
+
+@Data
+public class LoginRequest {
+    @NotBlank(message = "O e-mail é obrigatório.")
+    @Email(message = "Formato de e-mail inválido.")
+    private String email;
+
+    @NotBlank(message = "A senha é obrigatória.")
+    private String password;
+
+    private Integer twoFactorCode; 
+}
+
+
+// ==== /home/azureuser/projects/solubio-manutencao-api/src/main/java/com/solubio/manutencao/model/AuditLog.java ====
+//src/main/java/com/solubio/manutencao/model/AuditLog.java
+package com.solubio.manutencao.model;
+
+import jakarta.persistence.*;
+import lombok.Data;
+
+import java.time.LocalDateTime;
+
+@Entity
+@Data
+public class AuditLog {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    private String userEmail;
+    private String action; 
+    private String entity;
+    private Long entityId;
+    private String ipAddress;      
+    private String userAgent;      
+    private LocalDateTime timestamp = LocalDateTime.now();
+}
+
+// ==== /home/azureuser/projects/solubio-manutencao-api/src/main/java/com/solubio/manutencao/model/PasswordResetToken.java ====
+//src/main/java/com/solubio/manutencao/model/PasswordResetToken.java
+package com.solubio.manutencao.model;
+
+import jakarta.persistence.*;
+import lombok.Data;
+
+import java.time.LocalDateTime;
+
+@Entity
+@Data
+public class PasswordResetToken {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @Column(nullable = false, unique = true)
+    private String token;
+
+    @OneToOne
+    @JoinColumn(name = "user_id")
+    private User user;
+
+    private LocalDateTime expiryDate;
+}
+
+// ==== /home/azureuser/projects/solubio-manutencao-api/src/main/java/com/solubio/manutencao/model/RevokedToken.java ====
+//src/main/java/com/solubio/manutencao/model/RevokedToken.java
+package com.solubio.manutencao.model;
+
+import jakarta.persistence.*;
+import lombok.Data;
+
+import java.time.LocalDateTime;
+
+@Entity
+@Data
+public class RevokedToken {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @Column(nullable = false, unique = true)
+    private String token;
+
+    private LocalDateTime revokedAt;
+}
+
+// ==== /home/azureuser/projects/solubio-manutencao-api/src/main/java/com/solubio/manutencao/model/User.java ====
+// src/main/java/com/solubio/manutencao/model/User.java
+package com.solubio.manutencao.model;
+
+import jakarta.persistence.*;
+import lombok.*;
+
+import java.util.Set;
+import jakarta.persistence.Index;
+
+@Entity
+@Table(
+    name = "users",
+    indexes = {
+        @Index(name = "idx_user_email", columnList = "email")
+    }
+)
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+public class User {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @Column(nullable = false)
+    private String nome;
+
+    @Column(nullable = false, unique = true)
+    private String email;
+
+    @Column(nullable = false)
+    private String password;
+
+    @Column(name = "two_factor_enabled")
+    private Boolean twoFactorEnabled = false;
+
+    @Column(name = "two_factor_secret")
+    private String twoFactorSecret;
+
+    private String telefone;
+    private String setor;
+    private String cargo;
+
+    @ManyToMany(fetch = FetchType.EAGER)
+    @JoinTable(
+        name = "user_roles", 
+        joinColumns = @JoinColumn(name = "user_id", referencedColumnName = "id"),
+        inverseJoinColumns = @JoinColumn(name = "role_id", referencedColumnName = "id")
+    )
+    private Set<Role> roles;
+
+    public boolean isTwoFactorEnabled() {
+        return Boolean.TRUE.equals(twoFactorEnabled);
+    }
+}
+
+// ==== /home/azureuser/projects/solubio-manutencao-api/src/main/java/com/solubio/manutencao/model/Role.java ====
+// src/main/java/com/solubio/manutencao/model/Role.java
+package com.solubio.manutencao.model;
+
+import jakarta.persistence.*;
+import lombok.*;
+
+@Entity
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+public class Role {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+    
+    @Column(nullable = false, unique = true)
+    private String name;
+}
+
+// ==== /home/azureuser/projects/solubio-manutencao-api/src/main/java/com/solubio/manutencao/model/LoginAttempt.java ====
+//src/main/java/com/solubio/manutencao/model/LoginAttempt.java
+package com.solubio.manutencao.model;
+
+import jakarta.persistence.*;
+import lombok.Data;
+import java.time.LocalDateTime;
+
+@Entity
+@Data
+public class LoginAttempt {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    private String email;
+    private int attempts;
+    private LocalDateTime lastAttempt;
+    private boolean locked;
+
+    public LoginAttempt(String email, int attempts, boolean locked) {
+        this.email = email;
+        this.attempts = attempts;
+        this.locked = locked;
+        this.lastAttempt = LocalDateTime.now();
+    }
+
+    public LoginAttempt() {
+        this.lastAttempt = LocalDateTime.now();
+    }
+
+    public void incrementAttempts() {
+        this.attempts++;
+        this.lastAttempt = LocalDateTime.now();
+    }
+
+    public void resetAttempts() {
+        this.attempts = 0;
+        this.lastAttempt = LocalDateTime.now();
+    }
+}
+
+// ==== /home/azureuser/projects/solubio-manutencao-api/src/main/java/com/solubio/manutencao/model/RefreshToken.java ====
+//src/main/java/com/solubio/manutencao/model/RefreshToken.java
+package com.solubio.manutencao.model;
+
+import jakarta.persistence.*;
+import lombok.Data;
+
+import java.time.LocalDateTime;
+
+@Entity
+@Data
+public class RefreshToken {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @Column(nullable = false, unique = true)
+    private String token;
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "user_id")
+    private User user;
+
+    private LocalDateTime expiryDate;  
+
+    private boolean revoked = false;  
+}
+
+// ==== /home/azureuser/projects/solubio-manutencao-api/src/main/java/com/solubio/manutencao/model/AuthResponse.java ====
+//src/main/java/com/solubio/manutencao/model/AuthResponse.java
+package com.solubio.manutencao.model;
+
+public class AuthResponse {
+    private String accessToken;
+    private String refreshToken;
+
+    public AuthResponse(String accessToken, String refreshToken) {
+        this.accessToken = accessToken;
+        this.refreshToken = refreshToken;
+    }
+
+    public String getAccessToken() {
+        return accessToken;
+    }
+
+    public String getRefreshToken() {
+        return refreshToken;
+    }
+}
+
+// ==== /home/azureuser/projects/solubio-manutencao-api/src/main/java/com/solubio/manutencao/repository/AuditLogRepository.java ====
+//src/main/java/com/solubio/manutencao/repository/AuditLogRepository.java
+package com.solubio.manutencao.repository;
+
+import com.solubio.manutencao.model.AuditLog;
+import org.springframework.data.jpa.repository.JpaRepository;
+
+public interface AuditLogRepository extends JpaRepository<AuditLog, Long> {
+}
+
+// ==== /home/azureuser/projects/solubio-manutencao-api/src/main/java/com/solubio/manutencao/repository/PasswordResetTokenRepository.java ====
+//src/main/java/com/solubio/manutencao/repository/PasswordResetTokenRepository.java
+package com.solubio.manutencao.repository;
+
+import com.solubio.manutencao.model.PasswordResetToken;
+import com.solubio.manutencao.model.User;
+import org.springframework.data.jpa.repository.JpaRepository;
+
+import java.util.Optional;
+
+public interface PasswordResetTokenRepository extends JpaRepository<PasswordResetToken, Long> {
+    Optional<PasswordResetToken> findByToken(String token);
+    Optional<PasswordResetToken> findByUser(User user);
+}
+
+// ==== /home/azureuser/projects/solubio-manutencao-api/src/main/java/com/solubio/manutencao/repository/UserRepository.java ====
+//src/main/java/com/solubio/manutencao/repository/UserRepository.java
+package com.solubio.manutencao.repository;
+
+import com.solubio.manutencao.model.User;
+import org.springframework.data.jpa.repository.JpaRepository;
+
+import java.util.Optional;
+
+public interface UserRepository extends JpaRepository<User, Long> {
+    Optional<User> findByEmail(String email);
+}
+
+// ==== /home/azureuser/projects/solubio-manutencao-api/src/main/java/com/solubio/manutencao/repository/LoginAttemptRepository.java ====
+//src/main/java/com/solubio/manutencao/repository/LoginAttemptRepository.java
+package com.solubio.manutencao.repository;
+
+import com.solubio.manutencao.model.LoginAttempt;
+import org.springframework.data.jpa.repository.JpaRepository;
+
+import java.util.Optional;
+
+public interface LoginAttemptRepository extends JpaRepository<LoginAttempt, Long> {
+    Optional<LoginAttempt> findByEmail(String email);
+}
+
+// ==== /home/azureuser/projects/solubio-manutencao-api/src/main/java/com/solubio/manutencao/repository/RoleRepository.java ====
+//src/main/java/com/solubio/manutencao/repository/RoleRepository.java
+package com.solubio.manutencao.repository;
+
+import com.solubio.manutencao.model.Role;
+import org.springframework.data.jpa.repository.JpaRepository;
+
+public interface RoleRepository extends JpaRepository<Role, Long> {
+    Role findByName(String name);
+}
+
+// ==== /home/azureuser/projects/solubio-manutencao-api/src/main/java/com/solubio/manutencao/repository/RefreshTokenRepository.java ====
+//src/main/java/com/solubio/manutencao/repository/RefreshTokenRepository.java
+package com.solubio.manutencao.repository;
+
+import com.solubio.manutencao.model.RefreshToken;
+import org.springframework.data.jpa.repository.JpaRepository;
+
+import java.util.Optional;
+
+public interface RefreshTokenRepository extends JpaRepository<RefreshToken, Long> {
+    Optional<RefreshToken> findByToken(String token);
+    void deleteByUserId(Long userId);
+}
+
+// ==== /home/azureuser/projects/solubio-manutencao-api/src/main/java/com/solubio/manutencao/repository/RevokedTokenRepository.java ====
+//src/main/java/com/solubio/manutencao/repository/RevokedTokenRepository.java
+package com.solubio.manutencao.repository;
+
+import com.solubio.manutencao.model.RevokedToken;
+import org.springframework.data.jpa.repository.JpaRepository;
+
+import java.util.Optional;
+
+public interface RevokedTokenRepository extends JpaRepository<RevokedToken, Long> {
+    Optional<RevokedToken> findByToken(String token);
+    boolean existsByToken(String token);
+}
+
+// ==== /home/azureuser/projects/solubio-manutencao-api/src/main/java/com/solubio/manutencao/service/EmailService.java ====
+//src/main/java/com/solubio/manutencao/service/EmailService.java
+package com.solubio.manutencao.service;
+
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.mail.SimpleMailMessage;
+import org.springframework.mail.javamail.JavaMailSender;
+import org.springframework.stereotype.Service;
+
+@Service
+public class EmailService {
+
+    @Autowired
+    private JavaMailSender mailSender;
+
+    public void sendPasswordResetEmail(String to, String token) {
+        String subject = "Redefinição de Senha";
+        String text = "Clique no link abaixo para redefinir sua senha:\n" +
+                    "http://localhost:8080/auth/reset-password?token=" + token;
+
+        SimpleMailMessage message = new SimpleMailMessage();
+        message.setFrom("helpdesk@solubio.agr.br"); 
+        message.setTo(to);
+        message.setSubject(subject);
+        message.setText(text);
+
+        mailSender.send(message);
+    }
+}
+
+// ==== /home/azureuser/projects/solubio-manutencao-api/src/main/java/com/solubio/manutencao/service/AuditService.java ====
+//src/main/java/com/solubio/manutencao/service/AuditService.java
+package com.solubio.manutencao.service;
+
+import com.solubio.manutencao.model.AuditLog;
+import com.solubio.manutencao.repository.AuditLogRepository;
+import org.springframework.scheduling.annotation.Async;
+import org.springframework.stereotype.Service;
+
+@Service
+public class AuditService {
+
+    private final AuditLogRepository auditLogRepository;
+
+    public AuditService(AuditLogRepository auditLogRepository) {
+        this.auditLogRepository = auditLogRepository;
+    }
+
+    @Async
+    public void logAudit(String action, String entity, Long entityId, String userEmail, String ipAddress, String userAgent) {
+        AuditLog auditLog = new AuditLog();
+        auditLog.setAction(action);
+        auditLog.setEntity(entity);
+        auditLog.setEntityId(entityId);
+        auditLog.setUserEmail(userEmail);
+        auditLog.setIpAddress(ipAddress);  
+        auditLog.setUserAgent(userAgent);  
+        auditLogRepository.save(auditLog);
+    }
+}
+
+// ==== /home/azureuser/projects/solubio-manutencao-api/src/main/java/com/solubio/manutencao/service/CustomUserDetailsService.java ====
+//src/main/java/com/solubio/manutencao/service/CustomUserDetailsService.java
+package com.solubio.manutencao.service;
+
+import com.solubio.manutencao.model.User;
+import com.solubio.manutencao.repository.UserRepository;
+import org.springframework.security.core.userdetails.UserDetails;
+import org.springframework.security.core.userdetails.UserDetailsService;
+import org.springframework.security.core.userdetails.UsernameNotFoundException;
+import org.springframework.stereotype.Service;
+
+import java.util.Collections;
+
+@Service
+public class CustomUserDetailsService implements UserDetailsService {
+
+    private final UserRepository userRepository;
+
+    public CustomUserDetailsService(UserRepository userRepository) {
+        this.userRepository = userRepository;
+    }
+
+    @Override
+    public UserDetails loadUserByUsername(String email) throws UsernameNotFoundException {
+        User user = userRepository.findByEmail(email)
+                .orElseThrow(() -> new UsernameNotFoundException("Usuário não encontrado"));
+
+        if (user.getEmail() == null || user.getEmail().isEmpty()) {
+            throw new IllegalArgumentException("O e-mail do usuário não pode ser nulo ou vazio.");
+        }
+
+        if (user.getPassword() == null || user.getPassword().isEmpty()) {
+            throw new IllegalArgumentException("A senha do usuário não pode ser nula ou vazia.");
+        }
+
+        String[] roles = user.getRoles().stream()
+                .map(role -> role.getName())
+                .filter(roleName -> roleName != null && !roleName.isEmpty()) 
+                .toArray(String[]::new);
+
+        if (roles.length == 0) {
+            roles = new String[]{"USER"};
+        }
+
+        return org.springframework.security.core.userdetails.User.builder()
+                .username(user.getEmail())
+                .password(user.getPassword())
+                .roles(roles)
+                .build();
+    }
+}
+
+// ==== /home/azureuser/projects/solubio-manutencao-api/src/main/java/com/solubio/manutencao/service/TwoFactorAuthService.java ====
+//src/main/java/com/solubio/manutencao/service/TwoFactorAuthService.java
+package com.solubio.manutencao.service;
+
+import com.warrenstrange.googleauth.GoogleAuthenticator;
+import com.warrenstrange.googleauth.GoogleAuthenticatorKey;
+import com.google.zxing.BarcodeFormat;
+import com.google.zxing.client.j2se.MatrixToImageWriter;
+import com.google.zxing.common.BitMatrix;
+import com.google.zxing.qrcode.QRCodeWriter;
+import io.github.cdimascio.dotenv.Dotenv;
+import org.springframework.stereotype.Service;
+
+import javax.crypto.Cipher;
+import javax.crypto.spec.SecretKeySpec;
+import java.io.ByteArrayOutputStream;
+import java.util.Base64;
+
+@Service
+public class TwoFactorAuthService {
+
+    private final GoogleAuthenticator gAuth = new GoogleAuthenticator();
+    private final Dotenv dotenv = Dotenv.load();
+    private final String encryptionKey = dotenv.get("AES_SECRET_KEY");
+
+    public String generateSecretKey() {
+        GoogleAuthenticatorKey key = gAuth.createCredentials();
+        return key.getKey();
+    }
+
+    public String generateQrCode(String email, String secret) throws Exception {
+        String issuer = "Solubio Manutencao";
+        String qrCodeData = String.format("otpauth://totp/%s:%s?secret=%s&issuer=%s", issuer, email, secret, issuer);
+
+        QRCodeWriter qrCodeWriter = new QRCodeWriter();
+        BitMatrix bitMatrix = qrCodeWriter.encode(qrCodeData, BarcodeFormat.QR_CODE, 200, 200);
+
+        ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
+        MatrixToImageWriter.writeToStream(bitMatrix, "PNG", outputStream);
+
+        return Base64.getEncoder().encodeToString(outputStream.toByteArray());
+    }
+
+    public boolean verifyCode(String encryptedSecret, int code) {
+        try {
+            String secret = decrypt(encryptedSecret);
+            return gAuth.authorize(secret, code);
+        } catch (Exception e) {
+            e.printStackTrace();
+            return false;
+        }
+    }
+
+    public String encrypt(String secret) throws Exception {
+        SecretKeySpec key = new SecretKeySpec(Base64.getDecoder().decode(encryptionKey), "AES");
+        Cipher cipher = Cipher.getInstance("AES");
+        cipher.init(Cipher.ENCRYPT_MODE, key);
+        return Base64.getEncoder().encodeToString(cipher.doFinal(secret.getBytes()));
+    }
+
+    public String decrypt(String encryptedSecret) throws Exception {
+        SecretKeySpec key = new SecretKeySpec(Base64.getDecoder().decode(encryptionKey), "AES");
+        Cipher cipher = Cipher.getInstance("AES");
+        cipher.init(Cipher.DECRYPT_MODE, key);
+        return new String(cipher.doFinal(Base64.getDecoder().decode(encryptedSecret)));
+    }
+}
+
+
+// ==== /home/azureuser/projects/solubio-manutencao-api/src/main/java/com/solubio/manutencao/service/UserService.java ====
+//src/main/java/com/solubio/manutencao/service/UserService.java
+package com.solubio.manutencao.service;
+
+import com.solubio.manutencao.model.User;
+import com.solubio.manutencao.repository.UserRepository;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Service;
+
+import java.util.List;
+import java.util.Optional;
+
+@Service
+public class UserService {
+
+    @Autowired
+    private UserRepository userRepository;
+
+    public User createUser(User user) {
+        return userRepository.save(user);
+    }
+
+    public Optional<User> findByEmail(String email) {
+        return userRepository.findByEmail(email);
+    }
+
+    public Optional<User> findById(Long id) {
+        return userRepository.findById(id);
+    }
+
+    public User save(User user) {
+        return userRepository.save(user);
+    }
+
+    public boolean existsById(Long id) {
+        return userRepository.existsById(id);
+    }
+
+    public void deleteById(Long id) {
+        userRepository.deleteById(id);
+    }
+
+    public List<User> findAll() {
+        return userRepository.findAll();
+    }
+}
+

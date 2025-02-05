@@ -49,3 +49,6 @@ jacoco.exec
 
 # Configuração do Spring Boot (opcional)
 spring.log
+
+merge_files.py
+output.txt
