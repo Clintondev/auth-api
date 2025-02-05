@@ -6,10 +6,13 @@ import com.solubio.manutencao.model.User;
 import com.solubio.manutencao.model.AuthResponse;
 import com.solubio.manutencao.model.LoginRequest;
 import com.solubio.manutencao.model.RefreshToken;
+import com.solubio.manutencao.model.PasswordResetToken;
 import com.solubio.manutencao.repository.AuditLogRepository;
 import com.solubio.manutencao.repository.UserRepository;
 import com.solubio.manutencao.repository.LoginAttemptRepository;
 import com.solubio.manutencao.repository.RefreshTokenRepository;
+import com.solubio.manutencao.repository.PasswordResetTokenRepository;
+import com.solubio.manutencao.service.EmailService;
 import com.solubio.manutencao.model.LoginAttempt;
 import com.solubio.manutencao.security.JwtTokenProvider;
 import lombok.extern.slf4j.Slf4j;
@@ -23,6 +26,7 @@ import jakarta.servlet.http.HttpServletRequest;
 
 import java.time.LocalDateTime;
 import java.util.Map;
+import java.util.UUID;
 
 @RestController
 @RequestMapping("/auth")
@@ -46,6 +50,12 @@ public class AuthController {
 
     @Autowired
     private RefreshTokenRepository refreshTokenRepository;
+
+    @Autowired
+    private PasswordResetTokenRepository passwordResetTokenRepository;
+
+    @Autowired
+    private EmailService emailService;
 
     @Autowired
     private HttpServletRequest request;
@@ -135,5 +145,45 @@ public class AuthController {
         refreshTokenRepository.save(refreshToken);
 
         return ResponseEntity.ok("Logout realizado com sucesso.");
+    }
+
+    @PostMapping("/forgot-password")
+    public ResponseEntity<?> forgotPassword(@RequestBody Map<String, String> request) {
+        String email = request.get("email");
+        User user = userRepository.findByEmail(email)
+                .orElseThrow(() -> new RuntimeException("Usuário não encontrado."));
+
+        String token = UUID.randomUUID().toString();
+
+        PasswordResetToken resetToken = passwordResetTokenRepository.findByUser(user)
+                .orElseGet(() -> new PasswordResetToken());
+
+        resetToken.setToken(token);
+        resetToken.setUser(user);
+        resetToken.setExpiryDate(LocalDateTime.now().plusHours(1));
+        passwordResetTokenRepository.save(resetToken);
+
+        emailService.sendPasswordResetEmail(user.getEmail(), token);
+        return ResponseEntity.ok("E-mail de redefinição de senha enviado.");
+    }
+
+    @PostMapping("/reset-password")
+    public ResponseEntity<?> resetPassword(@RequestBody Map<String, String> request) {
+        String token = request.get("token");
+        String newPassword = request.get("newPassword");
+
+        PasswordResetToken resetToken = passwordResetTokenRepository.findByToken(token)
+                .orElseThrow(() -> new RuntimeException("Token inválido ou expirado."));
+
+        if (resetToken.getExpiryDate().isBefore(LocalDateTime.now())) {
+            return ResponseEntity.status(HttpStatus.BAD_REQUEST).body("Token expirado.");
+        }
+
+        User user = resetToken.getUser();
+        user.setPassword(passwordEncoder.encode(newPassword));
+        userRepository.save(user);
+        passwordResetTokenRepository.delete(resetToken);
+
+        return ResponseEntity.ok("Senha redefinida com sucesso.");
     }
 }

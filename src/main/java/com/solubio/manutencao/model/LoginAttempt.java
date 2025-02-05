@@ -17,7 +17,6 @@ public class LoginAttempt {
     private LocalDateTime lastAttempt;
     private boolean locked;
 
-    // Construtor personalizado
     public LoginAttempt(String email, int attempts, boolean locked) {
         this.email = email;
         this.attempts = attempts;
@@ -25,18 +24,15 @@ public class LoginAttempt {
         this.lastAttempt = LocalDateTime.now();
     }
 
-    // Construtor vazio necessário para o JPA
     public LoginAttempt() {
         this.lastAttempt = LocalDateTime.now();
     }
 
-    // Método para incrementar tentativas
     public void incrementAttempts() {
         this.attempts++;
         this.lastAttempt = LocalDateTime.now();
     }
 
-    // Método para resetar tentativas
     public void resetAttempts() {
         this.attempts = 0;
         this.lastAttempt = LocalDateTime.now();
